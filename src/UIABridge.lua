@@ -1,236 +1,291 @@
 --[[
   UAIBridge.lua
-  Que: Puente inteligente hacia Project UAI.
-  - Detecta si UAI está disponible en el entorno (executor/juego).
-  - Si existe → lo usa como agente principal (runMission, providers, sesiones).
-  - Si no existe → delega a NativeBridge como fallback.
-  No descarga scripts externos. Solo se conecta a lo que ya esté presente.
+  Qué: puente inteligente hacia Project UAI.
+  - Busca UAI en el entorno del executor/juego.
+  - Si lo encuentra, lo usa como agente.
+  - Si no lo encuentra, delega a NativeBridge.
+  No descarga scripts externos.
 ]]
-
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
 
 local UAIBridge = {}
 
--- Estado interno
-local _uai = nil          -- Referencia al agente UAI si se encuentra
-local _connected = false  -- true si UAI está activo
-local _native = nil       -- Referencia a NativeBridge (fallback)
-local _status = "BUSCANDO" -- BUSCANDO | CONECTADO | NATIVO | ERROR
+local _uai = nil
+local _native = nil
+local _connected = false
+local _status = "BUSCANDO"
 
--- ============ DETECCIÓN DE UAI ============
-
-local function log(msg)
-	print("[UAIBridge] " .. msg)
+local function log(message)
+	print("[UAIBridge] " .. tostring(message))
 end
 
 local function tryFindUAI()
-	-- Método 1: Globals comunes donde UAI suele inyectarse
 	local candidates = {
-		"_G.UAI",
-		"_G.ProjectUAI", 
-		"getgenv().UAI",
-		"getgenv().ProjectUAI",
-		"shared.UAI",
-		"shared.ProjectUAI",
+		function()
+			return _G.UAI
+		end,
+		function()
+			return _G.ProjectUAI
+		end,
+		function()
+			if type(getgenv) == "function" then
+				return getgenv().UAI
+			end
+			return nil
+		end,
+		function()
+			if type(getgenv) == "function" then
+				return getgenv().ProjectUAI
+			end
+			return nil
+		end,
+		function()
+			return shared.UAI
+		end,
+		function()
+			return shared.ProjectUAI
+		end,
+		function()
+			return UAI
+		end,
+		function()
+			return ProjectUAI
+		end,
 	}
-	
-	for _, path in ipairs(candidates) do
-		local ok, val = pcall(function()
-			return loadstring("return " .. path)()
-		end)
-		if ok and val ~= nil then
-			log("UAI encontrado en: " .. path)
-			return val
+
+	for _, getter in ipairs(candidates) do
+		local ok, value = pcall(getter)
+		if ok and value ~= nil then
+			return value
 		end
 	end
-	
-	-- Método 2: Verificar si hay un ModuleScript llamado "UAI" o "ProjectUAI" en el juego
-	local searchNames = { "UAI", "ProjectUAI", "UAI_Core", "UAI_Agent" }
-	pcall(function()
-		for _, name in ipairs(searchNames) do
-			-- Buscar en CoreGui (donde suelen inyectarse los executors)
-			local coreGui = game:GetService("CoreGui")
-			if coreGui then
-				local found = coreGui:FindFirstChild(name, true)
-				if found and found:IsA("ModuleScript") then
-					local ok, mod = pcall(function() return require(found) end)
-					if ok and mod then
-						log("UAI encontrado como ModuleScript en CoreGui: " .. name)
-						return mod
-					end
-				end
-			end
-			
-			-- Buscar en ReplicatedStorage
-			local rs = game:GetService("ReplicatedStorage")
-			if rs then
-				local found = rs:FindFirstChild(name, true)
-				if found and found:IsA("ModuleScript") then
-					local ok, mod = pcall(function() return require(found) end)
-					if ok and mod then
-						log("UAI encontrado en ReplicatedStorage: " .. name)
-						return mod
-					end
-				end
-			end
-		end
-	end)
-	
-	-- Método 3: Verificar si el executor expone una API de UAI directamente
+
+	local executorUAI = nil
 	pcall(function()
 		if type(getuai) == "function" then
-			local u = getuai()
-			if u then
-				log("UAI expuesto por executor via getuai()")
-				return u
-			end
+			executorUAI = getuai()
 		end
 	end)
-	
+
+	if executorUAI ~= nil then
+		return executorUAI
+	end
+
+	local function searchIn(parent)
+		if not parent then
+			return nil
+		end
+
+		local names = { "UAI", "ProjectUAI", "UAI_Core", "UAI_Agent" }
+
+		for _, name in ipairs(names) do
+			local ok, obj = pcall(function()
+				return parent:FindFirstChild(name, true)
+			end)
+
+			if ok and obj and obj:IsA("ModuleScript") then
+				local ok2, mod = pcall(function()
+					return require(obj)
+				end)
+
+				if ok2 and mod then
+					return mod
+				end
+			end
+		end
+
+		return nil
+	end
+
+	local found = nil
+
+	pcall(function()
+		found = searchIn(game:GetService("CoreGui"))
+	end)
+
+	if found then
+		return found
+	end
+
+	pcall(function()
+		found = searchIn(game:GetService("ReplicatedStorage"))
+	end)
+
+	if found then
+		return found
+	end
+
 	return nil
 end
 
--- ============ VERIFICACIÓN DE API ============
-
--- Valida que el objeto encontrado tenga la API esperada de UAI
 local function validateUAI(uai)
-	if type(uai) ~= "table" then return false, "No es una tabla" end
-	
-	-- Verificar funciones mínimas que necesitamos
-	local required = { "runMission", "ensure" }
-	local optional = { "show", "injectProvider", "sessions" }
-	
-	for _, fn in ipairs(required) do
-		if type(uai[fn]) ~= "function" then
-			return false, "Falta función requerida: " .. fn
-		end
+	if type(uai) ~= "table" then
+		return false, "UAI no es una tabla válida."
 	end
-	
-	return true, "OK"
+
+	if type(uai.runMission) == "function" then
+		return true, "OK"
+	end
+
+	if type(uai.execute) == "function" then
+		return true, "OK via execute adapter"
+	end
+
+	return false, "Falta runMission/execute en UAI."
 end
 
--- ============ INICIALIZACIÓN ============
+local function adaptUAI(uai)
+	if type(uai.runMission) == "function" then
+		return uai
+	end
+
+	local adapter = {}
+
+	for k, v in pairs(uai) do
+		adapter[k] = v
+	end
+
+	if type(uai.execute) == "function" then
+		function adapter.runMission(prompt, callback, cfg)
+			return uai.execute(prompt, callback, cfg)
+		end
+	end
+
+	if type(adapter.ensure) ~= "function" then
+		function adapter.ensure()
+			return true
+		end
+	end
+
+	return adapter
+end
 
 function UAIBridge.init(NativeBridgeModule)
 	_native = NativeBridgeModule
+	_status = "BUSCANDO"
+
 	log("Inicializando puente...")
-	
-	-- Intentar encontrar UAI
+
 	local found = tryFindUAI()
-	
+
 	if found then
-		local valid, msg = validateUAI(found)
+		local valid, message = validateUAI(found)
 		if valid then
-			_uai = found
+			_uai = adaptUAI(found)
 			_connected = true
 			_status = "CONECTADO"
-			log("✓ UAI conectado exitosamente. Agente activo.")
+			log("UAI conectado. Agente activo.")
 		else
-			log("⚠ Objeto encontrado pero API inválida: " .. msg)
-			log("  Usando modo nativo como fallback.")
+			_uai = nil
+			_connected = false
 			_status = "NATIVO"
+			log("UAI encontrado pero incompatible: " .. tostring(message))
 		end
 	else
-		log("⚠ UAI no encontrado en el entorno.")
-		log("  Usando modo nativo como fallback.")
+		_uai = nil
+		_connected = false
 		_status = "NATIVO"
+		log("UAI no encontrado. Usando NativeBridge.")
 	end
-	
+
 	return _connected
 end
 
--- ============ API PÚBLICA (compatible con Hack.lua) ============
-
--- Asegura que UAI esté listo (compatibilidad con API antigua)
 function UAIBridge.ensure(force)
-	if _connected then
-		-- Si ya estamos conectados, verificar que siga vivo
-		local ok, err = pcall(function()
+	if _connected and _uai then
+		local ok = pcall(function()
 			if type(_uai.ensure) == "function" then
-				return _uai.ensure(force)
+				_uai.ensure(force)
 			end
-			return true
 		end)
-		if ok then return true end
+
+		if ok then
+			return true
+		end
+
 		log("UAI dejó de responder. Cambiando a modo nativo.")
 		_connected = false
 		_status = "NATIVO"
 	end
-	
-	-- Reintentar detección si force = true
-	if force and not _connected then
+
+	if force then
 		local found = tryFindUAI()
 		if found then
 			local valid = validateUAI(found)
 			if valid then
-				_uai = found
+				_uai = adaptUAI(found)
 				_connected = true
 				_status = "CONECTADO"
 				return true
 			end
 		end
 	end
-	
-	return _connected
+
+	return false
 end
 
--- Ejecuta una misión/hackeo
--- Si UAI está conectado → lo usa como agente inteligente
--- Si no → usa NativeBridge para análisis básicos
 function UAIBridge.runMission(prompt, callback, cfg)
 	if _connected and _uai and type(_uai.runMission) == "function" then
-		log("Ejecutando misión via UAI (agente)...")
 		local ok, err = pcall(function()
 			_uai.runMission(prompt, callback, cfg)
 		end)
-		if not ok then
-			log("UAI falló: " .. tostring(err) .. ". Fallback a nativo.")
-			if _native and type(_native.runMission) == "function" then
-				_native.runMission(prompt, callback, cfg)
-			else
-				if callback then callback(false, "UAI y NativeBridge fallaron") end
-			end
+
+		if ok then
+			return
 		end
-	else
-		-- Modo nativo
-		if _native and type(_native.runMission) == "function" then
-			_native.runMission(prompt, callback, cfg)
-		else
-			if callback then
-				callback(false, "No hay agente disponible. UAI no encontrado y NativeBridge no inicializado.")
-			end
-		end
+
+		log("UAI.runMission falló: " .. tostring(err) .. ". Usando NativeBridge.")
+	end
+
+	if _native and type(_native.runMission) == "function" then
+		_native.runMission(prompt, callback, cfg)
+		return
+	end
+
+	if type(callback) == "function" then
+		callback(false, "No hay agente disponible: UAI no conectado y NativeBridge no inicializado.")
 	end
 end
 
--- Abrir paneles de UAI (si está conectado)
 function UAIBridge.show(section)
 	if _connected and _uai and type(_uai.show) == "function" then
-		local ok, err = pcall(function()
+		local ok, result = pcall(function()
 			return _uai.show(section)
 		end)
-		if ok then return true end
-		log("No se pudo abrir panel UAI: " .. tostring(err))
-		return false, "UAI.show falló"
+
+		if ok then
+			return true, result
+		end
+
+		return false, "UAI.show falló."
 	end
-	return false, "UAI no conectado"
+
+	return false, "UAI no conectado."
 end
 
--- Inyectar provider (Groq, OpenAI, etc.)
-function UAIBridge.injectProvider(prov, key)
+function UAIBridge.injectProvider(provider, key)
 	if _connected and _uai and type(_uai.injectProvider) == "function" then
 		local ok, result = pcall(function()
-			return _uai.injectProvider(prov, key)
+			return _uai.injectProvider(provider, key)
 		end)
-		if ok then return true, result end
-		return false, "UAI.injectProvider falló"
+
+		if ok then
+			return true, result
+		end
+
+		return false, "UAI.injectProvider falló."
 	end
-	-- Si no hay UAI, solo guardamos localmente
-	return true, "Guardado local (UAI no conectado)"
+
+	return true, "Guardado localmente. UAI no conectado."
 end
 
--- Sesiones (compatibilidad)
+function UAIBridge.getStatus()
+	return _status
+end
+
+function UAIBridge.isConnected()
+	return _connected
+end
+
 UAIBridge.sessions = {
 	open = function(...)
 		if _connected and _uai and _uai.sessions and type(_uai.sessions.open) == "function" then
@@ -245,14 +300,5 @@ UAIBridge.sessions = {
 		return true
 	end,
 }
-
--- Estado del puente (para mostrar en UI)
-function UAIBridge.getStatus()
-	return _status -- "CONECTADO" | "NATIVO" | "ERROR" | "BUSCANDO"
-end
-
-function UAIBridge.isConnected()
-	return _connected
-end
 
 return UAIBridge
