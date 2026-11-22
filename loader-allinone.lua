@@ -37,7 +37,6 @@ end
 local modules = {
 	Config = loadMod("src/Config.lua"),
 	Theme = loadMod("src/Theme.lua"),
-	Assets = loadMod("src/Assets.lua"),
 	UAIBridge = loadMod("src/UAIBridge.lua"),
 	Visual = loadMod("src/Visual.lua"),
 	UI_Chat = loadMod("src/UI_Chat.lua"),
