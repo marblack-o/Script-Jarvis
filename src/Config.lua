@@ -1,53 +1,121 @@
 --[[
   Config.lua
-  Que: lectura/escritura de capri_config.json en el filesystem del executor.
-  Por que: keys, chats e historial deben vivir fuera del repo (nunca en GitHub).
+  Qué: guarda y carga configuración local de J.A.R.V.I.S.
+  - Usa writefile/readfile si el executor lo permite.
+  - Si no, usa memoria/shared como fallback.
 ]]
 
 local HttpService = game:GetService("HttpService")
-local CONFIG_FILE = "capri_config.json"
 
 local Config = {}
 
-function Config.canFS()
-	return type(writefile) == "function"
-		and type(readfile) == "function"
-		and type(isfile) == "function"
+local FILE_NAME = "jarvis_config.json"
+local memory = {}
+
+local function safeDecode(content)
+	if type(content) ~= "string" or content == "" then
+		return nil
+	end
+
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(content)
+	end)
+
+	if ok and type(decoded) == "table" then
+		return decoded
+	end
+
+	return nil
 end
 
 function Config.load()
-	if not Config.canFS() then return {} end
-	local ok, data = pcall(function()
-		if isfile(CONFIG_FILE) then
-			return HttpService:JSONDecode(readfile(CONFIG_FILE))
+	local data = nil
+
+	if type(readfile) == "function" then
+		local ok, content = pcall(readfile, FILE_NAME)
+		if ok then
+			data = safeDecode(content)
 		end
-		return nil
-	end)
-	if ok and type(data) == "table" then return data end
-	return {}
+	end
+
+	if not data and shared and type(shared.__jarvis_config) == "table" then
+		data = shared.__jarvis_config
+	end
+
+	if not data and type(memory.last) == "table" then
+		data = memory.last
+	end
+
+	return data or {}
 end
 
 function Config.save(cfg)
-	if not Config.canFS() then return false end
-	return pcall(function()
-		writefile(CONFIG_FILE, HttpService:JSONEncode(cfg))
-	end)
+	if type(cfg) ~= "table" then
+		return
+	end
+
+	memory.last = cfg
+
+	if shared then
+		pcall(function()
+			shared.__jarvis_config = cfg
+		end)
+	end
+
+	if type(writefile) == "function" then
+		pcall(function()
+			writefile(FILE_NAME, HttpService:JSONEncode(cfg))
+		end)
+	end
 end
 
 function Config.ensureDefaults(cfg)
-	cfg = cfg or {}
-	cfg.provider_keys = type(cfg.provider_keys) == "table" and cfg.provider_keys or {}
-	cfg.chats = type(cfg.chats) == "table" and cfg.chats or {}
-	if #cfg.chats == 0 then
-		cfg.chats = {
-			{
-				id = HttpService:GenerateGUID(false),
-				title = "General",
-				messages = {},
-			},
-		}
+	cfg = type(cfg) == "table" and cfg or {}
+
+	if type(cfg.groq_key) ~= "string" then
+		cfg.groq_key = ""
 	end
-	cfg.active_chat = cfg.active_chat or cfg.chats[1].id
+
+	if type(cfg.provider_keys) ~= "table" then
+		cfg.provider_keys = {}
+	end
+
+	if type(cfg.chats) ~= "table" then
+		cfg.chats = {}
+	end
+
+	if #cfg.chats == 0 then
+		local id = HttpService:GenerateGUID(false)
+		table.insert(cfg.chats, {
+			id = id,
+			title = "Sesión inicial",
+			messages = {},
+		})
+		cfg.active_chat = id
+	end
+
+	for _, chat in ipairs(cfg.chats) do
+		if type(chat.messages) ~= "table" then
+			chat.messages = {}
+		end
+
+		if type(chat.title) ~= "string" or chat.title == "" then
+			chat.title = "Chat"
+		end
+	end
+
+	local activeValid = false
+	for _, chat in ipairs(cfg.chats) do
+		if chat.id == cfg.active_chat then
+			activeValid = true
+			break
+		end
+	end
+
+	if not activeValid then
+		cfg.active_chat = cfg.chats[1].id
+	end
+
 	return cfg
 end
 
