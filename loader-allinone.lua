@@ -5,7 +5,7 @@
 
 print("[JARVIS] Loader modular v8.1.0 (HUD Claude)...")
 
-local BASE = "https://raw.githubusercontent.com/marblack-o/JARVIS-script/cf42c98ae6b9512ef91ac5ddb5cf00fd251b94e9/"
+local BASE = "https://raw.githubusercontent.com/marblack-o/Script-Jarvis/main/"
 
 local function fetch(path)
 	local url = BASE .. path
