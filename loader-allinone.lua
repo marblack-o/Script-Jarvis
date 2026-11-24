@@ -1,12 +1,12 @@
 --[[
   loader-allinone.lua
-  Qué: bootstrap J.A.R.V.I.S. modular v9.0.0
+  Qué: bootstrap J.A.R.V.I.S. modular v9.1.0
   - Puente UAI si UAI está disponible en el entorno.
   - NativeBridge como fallback nativo.
   - Explorer integrado.
 ]]
 
-print("[JARVIS] Loader modular v9.0.0 (UAI bridge + native fallback)...")
+print("[JARVIS] Loader modular v9.1.0 (UAI bridge + native fallback)...")
 
 local BASE = "https://raw.githubusercontent.com/marblack-o/Script-Jarvis/main/"
 
