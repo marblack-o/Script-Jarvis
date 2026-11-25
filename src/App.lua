@@ -25,8 +25,49 @@ Use the same language as the user.
 local API_URL = "https://api.groq.com/openai/v1/chat/completions"
 local API_MODEL = "openai/gpt-oss-20b"
 
+-- Cuántos mensajes de historial se envían al modelo (anti-límite de tokens)
+local MAX_HISTORY = 30
+
+local UserInputService = game:GetService("UserInputService")
+
 local function trim(s)
 	return tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function makeDraggable(frame, handle)
+	local dragging = false
+	local start = nil
+	local startPos = nil
+
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			start = input.Position
+			startPos = frame.Position
+		end
+	end)
+
+	handle.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - start
+			frame.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
 end
 
 local function destroyOldHUD()
@@ -171,6 +212,76 @@ function App.start(modules, apiKey)
 	local ui = nil
 	local hack = nil
 
+	-- Cola de mensajes: evita peticiones concurrentes si el usuario
+	-- envía varios mensajes seguidos mientras el modelo responde.
+	local chatBusy = false
+	local messageQueue = {}
+
+	local function pumpQueue()
+		if chatBusy then
+			return
+		end
+
+		local text = table.remove(messageQueue, 1)
+		if not text then
+			return
+		end
+
+		chatBusy = true
+
+		task.spawn(function()
+			ui:setStatus("PROCESANDO...")
+			visual:setExpression("thinking")
+
+			if ui.showTyping then
+				ui:showTyping()
+			end
+
+			local chat = ui:getActiveChat()
+			local messages = {
+				{
+					role = "system",
+					content = JARVIS_PROMPT,
+				},
+			}
+
+			local history = chat.messages or {}
+			local startIndex = math.max(1, #history - MAX_HISTORY + 1)
+
+			for i = startIndex, #history do
+				local message = history[i]
+				if message.role == "user" or message.role == "assistant" then
+					table.insert(messages, {
+						role = message.role,
+						content = message.content,
+					})
+				end
+			end
+
+			local reply, err = groqChat(ui.API_KEY or apiKey, messages, 500)
+
+			if ui.hideTyping then
+				ui:hideTyping()
+			end
+
+			if not reply then
+				ui:addBubble("assistant", "Lo siento, Sir. No pude conectar con el modelo: " .. tostring(err))
+				visual:setExpression("error")
+				ui:setStatus("ERROR")
+			else
+				ui:addBubble("assistant", reply)
+				visual:setExpression("idle")
+				ui:setStatus(idleStatusText())
+			end
+
+			chatBusy = false
+
+			if #messageQueue > 0 then
+				pumpQueue()
+			end
+		end)
+	end
+
 	local uiOpts = {
 		gui = gui,
 		Theme = Theme,
@@ -186,64 +297,33 @@ function App.start(modules, apiKey)
 				return
 			end
 
-			ui.inputBox.Text = ""
-
 			if ui.activeTab ~= "chats" then
 				ui:setTab("chats")
 			end
 
 			ui:addBubble("user", text)
 
-			task.spawn(function()
-				if hack and hack.mode == "clarifying" then
-					hack:clarify(text)
+			-- Los mensajes de clarificación del override van directos,
+			-- no entran en la cola del chat normal.
+			if hack and hack.mode == "clarifying" then
+				hack:clarify(text)
+				return
+			end
+
+			if hack and hack.mode == "idle" and text:sub(1, 1) == "!" and not hack.running then
+				local clean = trim(text:sub(2))
+
+				if clean == "" then
+					ui:addBubble("assistant", "Indica la tarea después de !, Sir.")
 					return
 				end
 
-				if hack and hack.mode == "idle" and text:sub(1, 1) == "!" and not hack.running then
-					local clean = trim(text:sub(2))
+				hack:begin(clean)
+				return
+			end
 
-					if clean == "" then
-						ui:addBubble("assistant", "Indica la tarea después de !, Sir.")
-						return
-					end
-
-					hack:begin(clean)
-					return
-				end
-
-				ui:setStatus("PROCESANDO...")
-				visual:setExpression("thinking")
-
-				local chat = ui:getActiveChat()
-				local messages = {
-					{
-						role = "system",
-						content = JARVIS_PROMPT,
-					},
-				}
-
-				for _, message in ipairs(chat.messages or {}) do
-					if message.role == "user" or message.role == "assistant" then
-						table.insert(messages, {
-							role = message.role,
-							content = message.content,
-						})
-					end
-				end
-
-				local reply, err = groqChat(ui.API_KEY or apiKey, messages, 500)
-
-				if not reply then
-					ui:addBubble("assistant", "Lo siento, Sir. No pude conectar con el modelo: " .. tostring(err))
-					visual:setExpression("error")
-					ui:setStatus("ERROR")
-				else
-					ui:addBubble("assistant", reply)
-					visual:setExpression("idle")
-					ui:setStatus(idleStatusText())
-				end
-			end)
+			table.insert(messageQueue, text)
+			pumpQueue()
 		end,
 	}
 
@@ -312,6 +392,16 @@ function App.boot(modules)
 	Theme.mkCorner(setup, 6)
 	Theme.mkStroke(setup, Theme.chatGreen, 1.5, 0.25)
 	Theme.mkBrackets(setup, Theme.border, 2, 26)
+
+	-- Zona arrastrable superior (sin interferir con el TextBox)
+	local dragStrip = Instance.new("Frame")
+	dragStrip.Size = UDim2.new(1, 0, 0, 12)
+	dragStrip.Position = UDim2.fromOffset(0, 0)
+	dragStrip.BackgroundTransparency = 1
+	dragStrip.ZIndex = 61
+	dragStrip.Parent = setup
+
+	makeDraggable(setup, dragStrip)
 
 	local title = Instance.new("TextLabel")
 	title.Size = UDim2.new(1, -24, 0, 28)

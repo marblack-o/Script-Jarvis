@@ -1,18 +1,23 @@
 --[[
   UI_Chat.lua
   Qué: interfaz principal J.A.R.V.I.S.
-  - Chat.
+  - Chat con animaciones de entrada, timestamps y etiquetas de rol.
+  - Indicador de escritura ("J.A.R.V.I.S. está procesando...").
+  - Efectos visuales futuristas: scanline, grid, glow en burbujas.
   - Panel API/UAI.
   - Explorer.
   - Compatible con móvil.
-  Versión corregida.
+  v9.1.0
 ]]
 
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local UI_Chat = {}
 UI_Chat.__index = UI_Chat
+
+local MAX_SCROLLBACK = 200
 
 local function mk(class, props, parent)
 	local obj = Instance.new(class)
@@ -69,6 +74,22 @@ local function makeDraggable(frame, handle)
 	end)
 end
 
+local function addHoverFx(button, Theme, boost)
+	boost = boost or 0.12
+
+	local baseTransparency = button.BackgroundTransparency
+	local baseColor = button.BackgroundColor3
+
+	button.MouseEnter:Connect(function()
+		Theme.tween(button, { BackgroundTransparency = math.max(0, baseTransparency - boost) }, 0.12)
+	end)
+
+	button.MouseLeave:Connect(function()
+		button.BackgroundTransparency = baseTransparency
+		button.BackgroundColor3 = baseColor
+	end)
+end
+
 function UI_Chat.new(opts)
 	local self = setmetatable({}, UI_Chat)
 
@@ -82,6 +103,8 @@ function UI_Chat.new(opts)
 	self.onSend = opts.onSend
 
 	self.activeTab = "chats"
+	self._typing = nil
+	self._fx = {}
 
 	self:_build()
 	self:setTab("chats")
@@ -95,12 +118,24 @@ function UI_Chat:persist()
 end
 
 function UI_Chat:getActiveChat()
+	if type(self.cfg.chats) ~= "table" or #self.cfg.chats == 0 then
+		self.cfg.chats = {
+			{
+				id = HttpService:GenerateGUID(false),
+				title = "Sesión inicial",
+				messages = {},
+			},
+		}
+		self.cfg.active_chat = self.cfg.chats[1].id
+	end
+
 	for _, chat in ipairs(self.cfg.chats) do
 		if chat.id == self.cfg.active_chat then
 			return chat
 		end
 	end
 
+	self.cfg.active_chat = self.cfg.chats[1].id
 	return self.cfg.chats[1]
 end
 
@@ -150,6 +185,90 @@ function UI_Chat:setStatus(text)
 		self:setBorderMode("chat")
 	end
 end
+
+-- ============================================================
+-- EFECTOS FUTURISTAS
+-- ============================================================
+
+function UI_Chat:_spawnScanline(parent)
+	local Theme = self.Theme
+
+	local scan = mk("Frame", {
+		Name = "Scanline",
+		Size = UDim2.new(1, 0, 0, 1),
+		Position = UDim2.fromScale(0, 0),
+		BackgroundColor3 = Theme.border,
+		BackgroundTransparency = 0.75,
+		ZIndex = 30,
+	}, parent)
+
+	local conn
+	conn = RunService.RenderStepped:Connect(function(dt)
+		if not scan or not scan.Parent then
+			if conn then
+				conn:Disconnect()
+			end
+			return
+		end
+
+		local y = scan.Position.Y.Scale + dt * 0.18
+		if y > 1 then
+			y = 0
+		end
+
+		scan.Position = UDim2.fromScale(0, y)
+	end)
+
+	table.insert(self._fx, conn)
+	return scan
+end
+
+function UI_Chat:_spawnGrid(parent)
+	local Theme = self.Theme
+
+	local grid = mk("Frame", {
+		Name = "GridFx",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		ZIndex = 21,
+	}, parent)
+
+	for i = 1, 7 do
+		mk("Frame", {
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.fromScale(0, i / 8),
+			BackgroundColor3 = Theme.border,
+			BackgroundTransparency = 0.94,
+			ZIndex = 21,
+		}, grid)
+	end
+
+	for i = 1, 11 do
+		mk("Frame", {
+			Size = UDim2.new(0, 1, 1, 0),
+			Position = UDim2.fromScale(i / 12, 0),
+			BackgroundColor3 = Theme.border,
+			BackgroundTransparency = 0.95,
+			ZIndex = 21,
+		}, grid)
+	end
+
+	return grid
+end
+
+function UI_Chat:_scrollToBottom(force)
+	local canvas = self.msgScroll.AbsoluteCanvasSize.Y
+	local view = self.msgScroll.AbsoluteWindowSize.Y
+	local pos = self.msgScroll.CanvasPosition.Y
+
+	if force or (canvas - pos - view) < 80 then
+		self.msgScroll.CanvasPosition = Vector2.new(0, canvas)
+	end
+end
+
+-- ============================================================
+-- CONSTRUCCIÓN
+-- ============================================================
 
 function UI_Chat:_build()
 	local Theme = self.Theme
@@ -206,7 +325,7 @@ function UI_Chat:_build()
 	}, titleBar)
 
 	self.statusLbl = mk("TextLabel", {
-		Size = UDim2.new(0.45, -56, 1, 0),
+		Size = UDim2.new(0.45, -70, 1, 0),
 		Position = UDim2.new(0.55, 0, 0, 0),
 		BackgroundTransparency = 1,
 		Text = "SYSTEM ONLINE",
@@ -216,6 +335,39 @@ function UI_Chat:_build()
 		TextXAlignment = Enum.TextXAlignment.Right,
 		ZIndex = 22,
 	}, titleBar)
+
+	-- Punto de estado pulsante
+	local statusDot = mk("Frame", {
+		Size = UDim2.fromOffset(6, 6),
+		Position = UDim2.new(1, -58, 0.5, -3),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Theme.chatGreen,
+		ZIndex = 22,
+	}, titleBar)
+
+	Theme.mkCorner(statusDot, UDim.new(1, 0))
+
+	do
+		local growing = false
+		local conn
+		conn = RunService.RenderStepped:Connect(function(dt)
+			if not statusDot or not statusDot.Parent then
+				if conn then
+					conn:Disconnect()
+				end
+				return
+			end
+
+			local scale = 1 + math.sin(tick() * 3) * 0.25
+			statusDot.Size = UDim2.fromOffset(6 * scale, 6 * scale)
+
+			-- El punto toma el color del título según el estado
+			if self.titleLbl.TextColor3 ~= statusDot.BackgroundColor3 then
+				statusDot.BackgroundColor3 = self.titleLbl.TextColor3
+			end
+		end)
+		table.insert(self._fx, conn)
+	end
 
 	local closeBtn = mk("TextButton", {
 		Size = UDim2.fromOffset(26, 26),
@@ -235,6 +387,8 @@ function UI_Chat:_build()
 	closeBtn.MouseButton1Click:Connect(function()
 		self:close()
 	end)
+
+	addHoverFx(closeBtn, Theme, 0.3)
 
 	local body = mk("Frame", {
 		Size = UDim2.new(1, -16, 1, -50),
@@ -274,6 +428,10 @@ function UI_Chat:_build()
 	self.tabChats = tabButton("CHAT", 6)
 	self.tabProviders = tabButton("API / UAI", 34)
 	self.tabFiles = tabButton("EXPLORER", 62)
+
+	addHoverFx(self.tabChats, Theme)
+	addHoverFx(self.tabProviders, Theme)
+	addHoverFx(self.tabFiles, Theme)
 
 	self.tabChats.MouseButton1Click:Connect(function()
 		self:setTab("chats")
@@ -318,6 +476,8 @@ function UI_Chat:_build()
 
 	Theme.mkCorner(self.newChatBtn, 4)
 
+	addHoverFx(self.newChatBtn, Theme)
+
 	self.newChatBtn.MouseButton1Click:Connect(function()
 		local id = HttpService:GenerateGUID(false)
 
@@ -346,6 +506,8 @@ function UI_Chat:_build()
 
 	self.content = content
 
+	self:_spawnGrid(content)
+
 	self.msgScroll = mk("ScrollingFrame", {
 		Size = UDim2.new(1, -12, 1, -56),
 		Position = UDim2.fromOffset(6, 6),
@@ -361,6 +523,8 @@ function UI_Chat:_build()
 		Padding = UDim.new(0, 6),
 		SortOrder = Enum.SortOrder.LayoutOrder,
 	}, self.msgScroll)
+
+	self:_spawnScanline(content)
 
 	self.inputBar = mk("Frame", {
 		Size = UDim2.new(1, -12, 0, 40),
@@ -388,6 +552,15 @@ function UI_Chat:_build()
 		ZIndex = 24,
 	}, self.inputBar)
 
+	-- Brillo al enfocar el input
+	self.inputBox.Focused:Connect(function()
+		Theme.tween(self.inputBar, { BackgroundTransparency = 0 }, 0.15)
+	end)
+
+	self.inputBox.FocusLost:Connect(function()
+		Theme.tween(self.inputBar, { BackgroundTransparency = 0.1 }, 0.15)
+	end)
+
 	local sendBtn = mk("TextButton", {
 		Size = UDim2.new(0, 44, 1, -12),
 		Position = UDim2.new(1, -52, 0, 6),
@@ -401,6 +574,14 @@ function UI_Chat:_build()
 	}, self.inputBar)
 
 	Theme.mkCorner(sendBtn, 4)
+
+	sendBtn.MouseEnter:Connect(function()
+		Theme.tween(sendBtn, { BackgroundColor3 = Theme.accent }, 0.12)
+	end)
+
+	sendBtn.MouseLeave:Connect(function()
+		sendBtn.BackgroundColor3 = Theme.border
+	end)
 
 	sendBtn.MouseButton1Click:Connect(function()
 		self:_sendInput()
@@ -458,6 +639,10 @@ function UI_Chat:_sendInput()
 	end
 end
 
+-- ============================================================
+-- CHAT
+-- ============================================================
+
 function UI_Chat:refreshChatList()
 	for _, child in ipairs(self.sideList:GetChildren()) do
 		if child:IsA("TextButton") then
@@ -482,6 +667,10 @@ function UI_Chat:refreshChatList()
 
 		self.Theme.mkCorner(button, 4)
 
+		if chat.id == self.cfg.active_chat then
+			self.Theme.mkStroke(button, self.Theme.border, 1, 0.6)
+		end
+
 		button.MouseButton1Click:Connect(function()
 			self.cfg.active_chat = chat.id
 			self:persist()
@@ -494,43 +683,172 @@ end
 function UI_Chat:_appendBubble(role, text, order)
 	local Theme = self.Theme
 
+	local isUser = role == "user"
+
 	local bubble = mk("Frame", {
 		Size = UDim2.new(1, -10, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
-		BackgroundColor3 = role == "user" and Theme.bubbleUser or Theme.bubbleAi,
-		BackgroundTransparency = 0.08,
+		BackgroundColor3 = isUser and Theme.bubbleUser or Theme.bubbleAi,
+		BackgroundTransparency = 1,
 		LayoutOrder = order or #self.msgScroll:GetChildren(),
 		ZIndex = 23,
 	}, self.msgScroll)
 
 	Theme.mkCorner(bubble, 5)
 
-	if role ~= "user" then
+	if not isUser then
 		Theme.mkStroke(bubble, Theme.border, 1, 0.65)
+
+		-- Glow sutil en burbujas de J.A.R.V.I.S.
+		local gradient = Instance.new("UIGradient")
+		gradient.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.75),
+			NumberSequenceKeypoint.new(1, 0.9),
+		})
+		gradient.Rotation = 90
+		gradient.Parent = bubble
 	end
+
+	-- Barra lateral de acento
+	local accentBar = mk("Frame", {
+		Size = UDim2.new(0, 2, 1, -8),
+		Position = UDim2.new(isUser and 1 or 0, isUser and -3 or 1, 0.5, -4),
+		BackgroundColor3 = isUser and Theme.c2 or Theme.border,
+		BackgroundTransparency = 1,
+		ZIndex = 24,
+	}, bubble)
 
 	mk("UIPadding", {
 		PaddingTop = UDim.new(0, 6),
 		PaddingBottom = UDim.new(0, 6),
-		PaddingLeft = UDim.new(0, 8),
-		PaddingRight = UDim.new(0, 8),
+		PaddingLeft = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 10),
 	}, bubble)
 
-	mk("TextLabel", {
+	local roleTag = mk("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 12),
+		AutomaticSize = Enum.AutomaticSize.None,
+		BackgroundTransparency = 1,
+		Text = (isUser and ">> SIR" or "J.A.R.V.I.S.") .. "  //  " .. os.date("%H:%M"),
+		TextColor3 = isUser and Theme.c2 or Theme.accent,
+		Font = Enum.Font.Code,
+		TextSize = 9,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTransparency = 1,
+		ZIndex = 24,
+	}, bubble)
+
+	local body = mk("TextLabel", {
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundTransparency = 1,
 		Text = tostring(text),
-		TextColor3 = role == "user" and Theme.c2 or Theme.text,
+		TextColor3 = isUser and Theme.c2 or Theme.text,
 		Font = Enum.Font.Code,
 		TextSize = 13,
 		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top,
+		TextTransparency = 1,
 		ZIndex = 24,
 	}, bubble)
 
+	-- Animación de entrada: fade + deslizamiento
+	local targetBg = isUser and Theme.bubbleUser or Theme.bubbleAi
+
+	Theme.tween(bubble, { BackgroundTransparency = 0.08 }, 0.25)
+	Theme.tween(accentBar, { BackgroundTransparency = 0.15 }, 0.35)
+	Theme.tween(roleTag, { TextTransparency = 0.35 }, 0.3)
+	Theme.tween(body, { TextTransparency = 0 }, 0.3)
+
 	return bubble
+end
+
+function UI_Chat:showTyping()
+	self:hideTyping()
+
+	local Theme = self.Theme
+
+	local holder = mk("Frame", {
+		Size = UDim2.new(1, -10, 0, 34),
+		AutomaticSize = Enum.AutomaticSize.None,
+		BackgroundColor3 = Theme.bubbleAi,
+		BackgroundTransparency = 0.08,
+		LayoutOrder = (#self.msgScroll:GetChildren()),
+		ZIndex = 23,
+	}, self.msgScroll)
+
+	Theme.mkCorner(holder, 5)
+	Theme.mkStroke(holder, Theme.border, 1, 0.65)
+
+	local dots = {}
+
+	for i = 1, 3 do
+		local dot = mk("Frame", {
+			Size = UDim2.fromOffset(5, 5),
+			Position = UDim2.fromOffset(14 + (i - 1) * 12, 15),
+			BackgroundColor3 = Theme.accent,
+			BackgroundTransparency = 0.3,
+			ZIndex = 24,
+		}, holder)
+
+		Theme.mkCorner(dot, UDim.new(1, 0))
+		table.insert(dots, dot)
+	end
+
+	local caption = mk("TextLabel", {
+		Size = UDim2.new(1, -56, 1, 0),
+		Position = UDim2.fromOffset(52, 0),
+		BackgroundTransparency = 1,
+		Text = "PROCESANDO",
+		TextColor3 = Theme.textDim,
+		Font = Enum.Font.Code,
+		TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ZIndex = 24,
+	}, holder)
+
+	local conn
+	conn = RunService.RenderStepped:Connect(function()
+		if not holder or not holder.Parent then
+			if conn then
+				conn:Disconnect()
+			end
+			return
+		end
+
+		local t = tick() * 4
+		for i, dot in ipairs(dots) do
+			local wave = math.sin(t + i * 0.8)
+			dot.Position = UDim2.fromOffset(14 + (i - 1) * 12, 15 - wave * 3)
+			dot.BackgroundTransparency = 0.3 + (1 - (wave + 1) / 2) * 0.5
+		end
+	end)
+
+	self._typing = {
+		holder = holder,
+		conn = conn,
+	}
+
+	task.defer(function()
+		self:_scrollToBottom(true)
+	end)
+end
+
+function UI_Chat:hideTyping()
+	if not self._typing then
+		return
+	end
+
+	if self._typing.conn then
+		self._typing.conn:Disconnect()
+	end
+
+	if self._typing.holder then
+		self._typing.holder:Destroy()
+	end
+
+	self._typing = nil
 end
 
 function UI_Chat:renderActiveChat()
@@ -540,6 +858,8 @@ function UI_Chat:renderActiveChat()
 		end
 	end
 
+	self:hideTyping()
+
 	local chat = self:getActiveChat()
 
 	for index, message in ipairs(chat.messages or {}) do
@@ -547,25 +867,38 @@ function UI_Chat:renderActiveChat()
 	end
 
 	task.defer(function()
-		self.msgScroll.CanvasPosition = Vector2.new(0, self.msgScroll.AbsoluteCanvasSize.Y)
+		self:_scrollToBottom(true)
 	end)
 end
 
 function UI_Chat:addBubble(role, text)
 	local chat = self:getActiveChat()
 
+	chat.messages = chat.messages or {}
 	table.insert(chat.messages, {
 		role = role,
 		content = tostring(text),
 	})
 
+	-- Limitar historial para no inflar el payload ni la config
+	if #chat.messages > MAX_SCROLLBACK then
+		local overflow = #chat.messages - MAX_SCROLLBACK
+		for _ = 1, overflow do
+			table.remove(chat.messages, 1)
+		end
+	end
+
 	self:persist()
 	self:_appendBubble(role, text, #chat.messages)
 
 	task.defer(function()
-		self.msgScroll.CanvasPosition = Vector2.new(0, self.msgScroll.AbsoluteCanvasSize.Y)
+		self:_scrollToBottom(false)
 	end)
 end
+
+-- ============================================================
+-- PANELES
+-- ============================================================
 
 function UI_Chat:buildProviders()
 	for _, child in ipairs(self.providersPane:GetChildren()) do
@@ -597,7 +930,12 @@ function UI_Chat:buildProviders()
 
 	local bridgeStatus = "DESCONOCIDO"
 	if self.UAI and type(self.UAI.getStatus) == "function" then
-		bridgeStatus = self.UAI.getStatus()
+		local ok, result = pcall(function()
+			return self.UAI.getStatus()
+		end)
+		if ok then
+			bridgeStatus = result
+		end
 	end
 
 	addLabel(
@@ -772,6 +1110,16 @@ function UI_Chat:close()
 	if self.Visual and self.Visual.setChatOpen then
 		self.Visual:setChatOpen(false)
 	end
+end
+
+function UI_Chat:destroyFx()
+	for _, conn in ipairs(self._fx) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	self._fx = {}
+	self:hideTyping()
 end
 
 return UI_Chat
